@@ -223,6 +223,61 @@ class RobustSparseGPR(BaseEstimator, RegressorMixin):
             return y_pred
 
 
+class DeepKernelLearningGP(ApproximateGP):
+    """Deep Kernel Learning Gaussian Process
+    
+    Deep kernel learning을 사용하여 커널 함수를 신경망으로 학습하는 GP입니다.
+    입력 데이터를 신경망을 통해 특징 공간으로 변환한 후 GP를 적용합니다.
+    """
+    
+    def __init__(self, inducing_points, input_dim, hidden_dims=[128, 64], 
+                 kernel_type='rbf', dropout=0.1):
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = VariationalStrategy(
+            self, inducing_points, variational_distribution,
+            learn_inducing_locations=True
+        )
+        super(DeepKernelLearningGP, self).__init__(variational_strategy)
+        
+        self.mean_module = gpytorch.means.ConstantMean()
+        
+        # 특징 추출기 (Neural Network)
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                torch.nn.Linear(prev_dim, hidden_dim),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(dropout)
+            ])
+            prev_dim = hidden_dim
+        
+        self.feature_extractor = torch.nn.Sequential(*layers)
+        
+        # 커널 모듈
+        if kernel_type == 'rbf':
+            self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+        elif kernel_type == 'matern':
+            self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=1.5))
+        elif kernel_type == 'spectral':
+            self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.SpectralMixtureKernel(
+                num_mixtures=4, ard_num_dims=prev_dim
+            ))
+        
+        self.name = f"DeepKernel_GP_{kernel_type}_{'_'.join(map(str, hidden_dims))}"
+    
+    def forward(self, x):
+        # 특징 추출
+        projected_x = self.feature_extractor(x)
+        
+        # GP 적용
+        mean_x = self.mean_module(projected_x)
+        covar_x = self.covar_module(projected_x)
+        
+        return MultivariateNormal(mean_x, covar_x)
+
+
 class DeepSparseGP(ApproximateGP):
     """Deep Gaussian Process with Sparse Inducing Points
     
@@ -267,6 +322,63 @@ class DeepSparseGP(ApproximateGP):
         return MultivariateNormal(mean_x, covar_x)
 
 
+class MultiTaskDeepKernelGP(ApproximateGP):
+    """Multi-task Deep Kernel Learning GP
+    
+    다중 태스크 학습을 위한 deep kernel learning입니다.
+    여러 관련 태스크를 동시에 학습하여 더 나은 일반화 성능을 달성합니다.
+    """
+    
+    def __init__(self, inducing_points, input_dim, num_tasks=1, 
+                 hidden_dims=[128, 64], kernel_type='rbf'):
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = VariationalStrategy(
+            self, inducing_points, variational_distribution,
+            learn_inducing_locations=True
+        )
+        super(MultiTaskDeepKernelGP, self).__init__(variational_strategy)
+        
+        self.num_tasks = num_tasks
+        self.mean_module = gpytorch.means.MultitaskMean(
+            gpytorch.means.ConstantMean(), num_tasks=num_tasks
+        )
+        
+        # 공유 특징 추출기
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                torch.nn.Linear(prev_dim, hidden_dim),
+                torch.nn.ReLU()
+            ])
+            prev_dim = hidden_dim
+        
+        self.feature_extractor = torch.nn.Sequential(*layers)
+        
+        # 멀티태스크 커널
+        if kernel_type == 'rbf':
+            data_kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+        elif kernel_type == 'matern':
+            data_kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=1.5))
+        
+        self.covar_module = gpytorch.kernels.MultitaskKernel(
+            data_kernel, num_tasks=num_tasks, rank=min(num_tasks, 3)
+        )
+        
+        self.name = f"MultiTaskDeepKernel_GP_{kernel_type}_T{num_tasks}"
+    
+    def forward(self, x):
+        # 특징 추출
+        projected_x = self.feature_extractor(x)
+        
+        # GP 적용
+        mean_x = self.mean_module(projected_x)
+        covar_x = self.covar_module(projected_x)
+        
+        return MultivariateNormal(mean_x, covar_x)
+
+
 class AdvancedGPRWrapper:
     """고급 GPR 모델들의 공통 래퍼 클래스"""
     
@@ -280,6 +392,7 @@ class AdvancedGPRWrapper:
         self.model = None
         self.likelihood = None
         self.kwargs = kwargs
+        self.input_dim = None
     
     def _create_model(self, inducing_points):
         """모델 타입에 따라 적절한 모델 생성"""
@@ -292,6 +405,12 @@ class AdvancedGPRWrapper:
         elif self.model_type == 'deep_sparse':
             return DeepSparseGP(inducing_points, kernel_type=self.kernel_type, 
                               **self.kwargs)
+        elif self.model_type == 'deep_kernel_learning':
+            return DeepKernelLearningGP(inducing_points, self.input_dim, 
+                                      kernel_type=self.kernel_type, **self.kwargs)
+        elif self.model_type == 'multitask_deep_kernel':
+            return MultiTaskDeepKernelGP(inducing_points, self.input_dim, 
+                                       kernel_type=self.kernel_type, **self.kwargs)
         elif self.model_type == 'robust_sparse':
             return RobustSparseGPR(n_inducing=self.n_inducing, 
                                  kernel_type=self.kernel_type, **self.kwargs)
@@ -301,6 +420,9 @@ class AdvancedGPRWrapper:
     def fit(self, X_train, y_train):
         """모델 훈련"""
         print(f"Training Advanced GPR: {self.model_type}")
+        
+        # 입력 차원 저장
+        self.input_dim = X_train.shape[1]
         
         if self.model_type == 'robust_sparse':
             # scikit-learn 스타일 모델
@@ -317,7 +439,15 @@ class AdvancedGPRWrapper:
             inducing_points = train_x[inducing_indices].clone()
             
             self.model = self._create_model(inducing_points)
-            self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            
+            # 멀티태스크 모델의 경우 다른 likelihood 사용
+            if self.model_type == 'multitask_deep_kernel':
+                self.likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(
+                    num_tasks=self.kwargs.get('num_tasks', 1)
+                )
+            else:
+                self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            
             self.name = self.model.name
             
             # 훈련 모드
@@ -417,6 +547,46 @@ def create_advanced_models():
         kernel_type='rbf',
         epochs=50,
         n_layers=2
+    ))
+    
+    # Deep Kernel Learning GP - RBF
+    models.append(AdvancedGPRWrapper(
+        model_type='deep_kernel_learning',
+        n_inducing=100,
+        kernel_type='rbf',
+        epochs=80,
+        hidden_dims=[128, 64],
+        dropout=0.1
+    ))
+    
+    # Deep Kernel Learning GP - Matern
+    models.append(AdvancedGPRWrapper(
+        model_type='deep_kernel_learning',
+        n_inducing=100,
+        kernel_type='matern',
+        epochs=80,
+        hidden_dims=[128, 64],
+        dropout=0.1
+    ))
+    
+    # Deep Kernel Learning GP - Spectral
+    models.append(AdvancedGPRWrapper(
+        model_type='deep_kernel_learning',
+        n_inducing=100,
+        kernel_type='spectral',
+        epochs=80,
+        hidden_dims=[64, 32],
+        dropout=0.1
+    ))
+    
+    # Deep Kernel Learning GP - Deeper Network
+    models.append(AdvancedGPRWrapper(
+        model_type='deep_kernel_learning',
+        n_inducing=100,
+        kernel_type='rbf',
+        epochs=80,
+        hidden_dims=[256, 128, 64],
+        dropout=0.2
     ))
     
     return models
